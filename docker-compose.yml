@@ -1,0 +1,159 @@
+name: telemetry-pipeline
+
+x-app: &app
+  build: .
+  # One image shared by collector / processor / etl / tests.
+  image: telemetry-app:local
+  restart: unless-stopped
+  environment: &app-env
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    DATABASE_URL: postgresql://telemetry:telemetry@postgres:5432/telemetry
+
+services:
+  kafka:
+    image: apache/kafka:3.9.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:${KAFKA_HOST_PORT:-29092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "${KAFKA_HOST_PORT:-29092}:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  # One-shot: create topics explicitly (auto-create is disabled).
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic telemetry.raw --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic telemetry.dlq --partitions 1 --replication-factor 1 --config retention.ms=2592000000
+    restart: "no"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: telemetry
+      POSTGRES_PASSWORD: telemetry
+      POSTGRES_DB: telemetry
+    ports:
+      - "${PG_HOST_PORT:-5432}:5432"
+    volumes:
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telemetry -d telemetry"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Two simulated devices, each with its own collector, to exercise per-device
+  # keys / partitions and per-device windows.
+  simulator: &simulator
+    build: ./simulator
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 5020), 2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  simulator-2: *simulator
+
+  collector: &collector
+    <<: *app
+    command: ["python", "-m", "telemetry.collector"]
+    environment:
+      <<: *app-env
+      MODBUS_HOST: simulator
+      MODBUS_PORT: "5020"
+      DEVICE_ID: sim-001
+      # ~2% of messages are corrupted on purpose to demonstrate the DLQ. Set to 0 to disable.
+      FAULT_INJECTION_RATE: "0.02"
+    depends_on:
+      simulator:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  collector-2:
+    <<: *collector
+    environment:
+      <<: *app-env
+      MODBUS_HOST: simulator-2
+      MODBUS_PORT: "5020"
+      DEVICE_ID: sim-002
+      FAULT_INJECTION_RATE: "0.02"
+    depends_on:
+      simulator-2:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  processor:
+    <<: *app
+    command: ["python", "-m", "telemetry.processor"]
+    environment:
+      <<: *app-env
+      ALLOWED_LATENESS_S: "10"
+      IDLE_TIMEOUT_S: "30"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  etl:
+    <<: *app
+    command: ["python", "-m", "telemetry.etl"]
+    # Run with the host user's ids so the Parquet files in ./data/lake are writable
+    # and owned by you on Linux (Docker Desktop on Windows/macOS does not care).
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      <<: *app-env
+      LAKE_PATH: /data/lake
+      ETL_INTERVAL_S: "60"
+    volumes:
+      - ./data/lake:/data/lake
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Unit tests:        docker compose run --rm tests
+  # Integration tests: docker compose run --rm -e RUN_INTEGRATION=1 tests pytest -v tests/integration
+  #                    (needs the stack to be running)
+  tests:
+    build: .
+    image: telemetry-app:local
+    command: ["pytest", "-v"]
+    environment:
+      <<: *app-env
+      LAKE_PATH: /data/lake
+    volumes:
+      - ./data/lake:/data/lake:ro
+    profiles: ["tests"]
+
+volumes:
+  kafka-data:
+  pg-data:
